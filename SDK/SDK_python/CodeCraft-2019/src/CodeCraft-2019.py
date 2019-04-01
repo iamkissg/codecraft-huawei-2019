@@ -93,7 +93,7 @@ def main():
     #         logger.info(lane.__dict__)
     # logger.info(cross_indexer)
     # logger.info(road_indexer)
-    scheduler = Scheduler(crosses, roads, cars, capacity_threshold=0.5, num_cars_on_road=128)
+    scheduler = Scheduler(crosses, roads, cars, capacity_threshold=0.5, num_cars_on_road=1024)
     nx.draw(scheduler.roadnet)
 
     while scheduler.cars_to_run or scheduler.running_cars:

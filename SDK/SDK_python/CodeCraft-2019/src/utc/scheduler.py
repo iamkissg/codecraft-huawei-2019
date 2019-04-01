@@ -3,9 +3,12 @@ import sys
 import logging
 import copy
 import random
+import multiprocessing
 from math import floor
-from collections import OrderedDict, defaultdict
 from queue import Queue
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
 
 import numpy as np
 
@@ -34,9 +37,9 @@ class Scheduler(object):
             (road.start_cross_id, road.end_cross_id, {'weight': road.length / road.highest_speed})
             for road in roads
         ])
-        self.cars_to_run = cars   # 待上路车辆
-        self.running_cars = []    # 路上车辆
-        self.ended_cars = []      # 结束车辆
+        self.cars_to_run = {car.car_id: car for car in cars}   # 待上路车辆
+        self.running_cars = {}    # 路上车辆
+        self.ended_cars = {}      # 结束车辆
         self.crosses = OrderedDict([
             (cross.cross_id, cross)
             for cross in sorted(crosses, key=lambda c: int(c.cross_id))
@@ -60,14 +63,14 @@ class Scheduler(object):
 
         self._arrange_cars_to_run()
 
-    def _send_run_signals(self):
-        for car in self.running_cars:
+    def _send_run_signals(self, cars):
+        for car in cars.values():
             car.state = CAR_TO_RUN
             car.pass_intention = None
             car.road_to_turn = None
     
     def _check_positions(self, cars):
-        for car in cars:
+        for car in cars.values():
             if car.state == CAR_END:
                 continue
             road = self.roads.get(car.on_road)
@@ -76,11 +79,12 @@ class Scheduler(object):
 
     def schedule(self):
         # step1, 调度路上车辆
-        self._send_run_signals()
+        self._send_run_signals(self.running_cars)
         self._schedule_running_cars()
         self._check_positions(self.running_cars)
 
         # step3, 根据当前路网与道路的情况, 选择车辆上路
+        logger.info('第{t}个时间片调度\t{n}辆车在路上'.format(t=self.current_time, n=len(self.running_cars)))
         self._schedule_cars_to_run()
 
         logger.info('第{t}个时间片调度\t调度完成'.format(t=self.current_time))
@@ -97,34 +101,65 @@ class Scheduler(object):
         road2car_flows = {}  # [[当前道路], [右侧道路], [对面道路], [左边道路]] 视为一个 car_flow
         roads = list(cross.connected_roads.values())
         for i, road_id in enumerate(cross.connected_roads.keys()):
-            cars = [
-                roads[i%4].lanes[lane].positions[pos]
+            cars = OrderedDict([
+                (roads[i%4].lanes[lane].positions[pos].car_id, roads[i%4].lanes[lane].positions[pos])
                 for pos in range(roads[i%4].length)
                 for lane in range(len(roads[i%4].lanes))
                 if roads[i%4].lanes[lane].positions[pos] and roads[i%4].lanes[lane].positions[pos].state != CAR_STOP
-            ] if roads[i%4] else []
-            right_cars = [
-                roads[(i+1)%4].lanes[lane].positions[pos]
+            ]) if roads[i%4] else {}
+            right_cars = OrderedDict([
+                (roads[(i+1)%4].lanes[lane].positions[pos].car_id, roads[(i+1)%4].lanes[lane].positions[pos])
                 for pos in range(roads[(i+1)%4].length)
                 for lane in range(len(roads[(i+1)%4].lanes))
                 if roads[(i+1)%4].lanes[lane].positions[pos] and roads[(i+1)%4].lanes[lane].positions[pos].state != CAR_STOP
-            ] if roads[(i+1)%4] else []
-            opposite_cars = [
-                roads[(i+2)%4].lanes[lane].positions[pos]
+            ]) if roads[(i+1)%4] else {}
+            opposite_cars = OrderedDict([
+                (roads[(i+2)%4].lanes[lane].positions[pos].car_id, roads[(i+2)%4].lanes[lane].positions[pos])
                 for pos in range(roads[(i+2)%4].length)
                 for lane in range(len(roads[(i+2)%4].lanes))
                 if roads[(i+2)%4].lanes[lane].positions[pos] and roads[(i+2)%4].lanes[lane].positions[pos].state != CAR_STOP
-            ] if roads[(i+2)%4] else []
-            left_cars = [
-                roads[(i+3)%4].lanes[lane].positions[pos]
+            ]) if roads[(i+2)%4] else {}
+            left_cars = OrderedDict([
+                (roads[(i+3)%4].lanes[lane].positions[pos].car_id, roads[(i+3)%4].lanes[lane].positions[pos])
                 for pos in range(roads[(i+3)%4].length)
                 for lane in range(len(roads[(i+3)%4].lanes))
                 if roads[(i+3)%4].lanes[lane].positions[pos] and roads[(i+3)%4].lanes[lane].positions[pos].state != CAR_STOP
-            ] if roads[(i+3)%4] else []
+            ]) if roads[(i+3)%4] else {}
 
             road2car_flows[road_id] = [cars, right_cars, opposite_cars, left_cars]
 
         return road2car_flows
+
+    def _schedule_cross_1(self, cross):
+        for road in cross.connected_roads.values():
+            if road:
+                for lane in road.lanes:
+                    self._schedule_cars_move_on_the_same_way(OrderedDict([(car.car_id, car) for car in lane.positions if car]))
+
+    def _schedule_cross_2(self, cross):
+        road2car_flows = self._get_road2car_flows(cross)
+        # num_rest_cars 用以观察记录当前是否已经不存在可调度的车辆了, 也许路口内车辆在等待其他路口的车辆, 因此跳过
+        num_rest_cars = len([car.car_id for car in self.running_cars.values() if car.state != CAR_STOP])
+        while True:
+            for road_id in sorted(cross.connected_roads.keys(), key=lambda k: int(k)):
+                if road_id in (-1, -2):
+                    continue
+                cars, right_cars, opposite_cars, left_cars = road2car_flows[road_id]
+                # car_flows = cars + right_cars + opposite_cars + left_cars
+                # 名义上的过路口车辆调度, 但车辆可能过不了路口
+                self._schedule_cars_pass_cross(cars, right_cars, opposite_cars, left_cars)
+                # cars = self._schedule_cars_pass_cross(cars, right_cars, opposite_cars, left_cars)
+                # if cars:
+                #     self.running_cars.update(cars)
+                # logger.info('\t\t剩余待调度车辆: {}'.format(len([car.car_id for car in self.running_cars if car.state != CAR_STOP])))
+                
+            # 条件成立, 路口内有车辆被调度, 也许还有车辆因为这一次调度可以走了, 因此不跳出 while 循环
+            new_num_rest_cars = len([car.car_id for car in self.running_cars.values() if car.state != CAR_STOP])
+            if new_num_rest_cars < num_rest_cars:
+                num_rest_cars = new_num_rest_cars
+            else:
+                self._check_positions(self.running_cars)  # 不放心可以再检查一遍
+                break
 
     def _schedule_running_cars(self):
         """对每条道路上的车辆, 按照从路口开始的顺序调度"""
@@ -133,56 +168,70 @@ class Scheduler(object):
 
         while True:
             # 除了完成调度的车辆, 只有当全部车辆转为 CAR_STOP 才意味着本次调度结束
-            if len([car for car in self.running_cars if car.state!=CAR_STOP]) == 0:
+            if len([car for car in self.running_cars.values() if car.state!=CAR_STOP]) == 0:
                 break
 
-            assert None not in self.running_cars
+            assert None not in self.running_cars.values()
 
             # 9. 系统调度详细说明 6. 调度处理逻辑 第一步: 处理所有道路的车辆的顺序, 即让能跑的车都跑了
             # 以下处理会有一些问题, 因为车辆在 self.running_cars 中并非按照道路上的词序排列
             # self._schedule_cars_move_on_the_same_way(self.running_cars)
+
+            # with ProcessPoolExecutor() as ex:
+            # with ThreadPoolExecutor() as ex:
+            #     ex.map(self._schedule_cross_1, self.crosses.values())
+
+            # car_flows = []
             for cross in self.crosses.values():
-                for road in cross.connected_roads.values():
-                    if road:
-                        for lane in road.lanes:
-                            self._schedule_cars_move_on_the_same_way([car for car in lane.positions if car])
-                #         car_flows.extend([
-                #             road.lanes[lane].positions[pos]
-                #             for lane in range(len(road.lanes))
-                #             for pos in range(road.length)
-                #             if road.lanes[lane].positions[pos] # and road.lanes[lane].positions[pos].state != CAR_TO_RUN
-                #         ])
-                # self._schedule_cars_move_on_the_same_way(car_flows)
+                self._schedule_cross_1(cross)
+            #     for road in cross.connected_roads.values():
+            #         car_flows.append(OrderedDict([
+            #             (road.lanes[lane].positions[pos].car_id, road.lanes[lane].positions[pos])
+            #             for lane in range(len(road.lanes))
+            #             for pos in range(road.length)
+            #             if road.lanes[lane].positions[pos] # and road.lanes[lane].positions[pos].state != CAR_TO_RUN
+            #         ]) if road else {})
+            #     # self._schedule_cars_move_on_the_same_way(car_flows)
+
+            # with ProcessPoolExecutor() as ex:
+            #     car_flows = ex.map(self._schedule_cars_move_on_the_same_way, car_flows)
+
+            # for car_flow in car_flows:
+            #     if car_flow: self.running_cars.update(car_flow)
 
             # 经过以上调度, 路上只有两种状态的车辆, 已完成调度的 CAT_STOP 或等待调度的 CAR_RUNNING
-            assert not [car for car in self.running_cars if car.state == CAR_TO_RUN]
+            assert not [car for car in self.running_cars.values() if car.state == CAR_TO_RUN]
 
             # logger.info('第{t}个时间片调度\t完成路网中所有可直接调度车辆, 剩余{n}辆车等待调度'.format(
             #     t=self.current_time, n=len([car.car_id for car in self.running_cars if car.state != CAR_STOP])))
             
-            for cross in self.crosses.values():
-                road2car_flows = self._get_road2car_flows(cross)
-                # num_rest_cars 用以观察记录当前是否已经不存在可调度的车辆了, 也许路口内车辆在等待其他路口的车辆, 因此跳过
-                num_rest_cars = len([car.car_id for car in self.running_cars if car.state != CAR_STOP])
-                while True:
-                    for road_id in sorted(cross.connected_roads.keys(), key=lambda k: int(k)):
-                        if road_id in (-1, -2):
-                            continue
-                        cars, right_cars, opposite_cars, left_cars = road2car_flows[road_id]
-                        # car_flows = cars + right_cars + opposite_cars + left_cars
-                        # 名义上的过路口车辆调度, 但车辆可能过不了路口
-                        self._schedule_cars_pass_cross(cars, right_cars, opposite_cars, left_cars)
-                        # logger.info('\t\t剩余待调度车辆: {}'.format(len([car.car_id for car in self.running_cars if car.state != CAR_STOP])))
-                        
-                    # 条件成立, 路口内有车辆被调度, 也许还有车辆因为这一次调度可以走了, 因此不跳出 while 循环
-                    new_num_rest_cars = len([car.car_id for car in self.running_cars if car.state != CAR_STOP])
-                    if new_num_rest_cars < num_rest_cars:
-                        num_rest_cars = new_num_rest_cars
-                    else:
-                        self._check_positions(self.running_cars)  # 不放心可以再检查一遍
-                        break
+            # with ThreadPoolExecutor() as ex:
+            #     ex.map(self._schedule_cross_2, self.crosses.values())
 
-        for car in self.running_cars:
+            for cross in self.crosses.values():
+                self._schedule_cross_2(cross)
+            #     road2car_flows = self._get_road2car_flows(cross)
+            #     # num_rest_cars 用以观察记录当前是否已经不存在可调度的车辆了, 也许路口内车辆在等待其他路口的车辆, 因此跳过
+            #     num_rest_cars = len([car.car_id for car in self.running_cars if car.state != CAR_STOP])
+            #     while True:
+            #         for road_id in sorted(cross.connected_roads.keys(), key=lambda k: int(k)):
+            #             if road_id in (-1, -2):
+            #                 continue
+            #             cars, right_cars, opposite_cars, left_cars = road2car_flows[road_id]
+            #             # car_flows = cars + right_cars + opposite_cars + left_cars
+            #             # 名义上的过路口车辆调度, 但车辆可能过不了路口
+            #             self._schedule_cars_pass_cross(cars, right_cars, opposite_cars, left_cars)
+            #             # logger.info('\t\t剩余待调度车辆: {}'.format(len([car.car_id for car in self.running_cars if car.state != CAR_STOP])))
+                        
+            #         # 条件成立, 路口内有车辆被调度, 也许还有车辆因为这一次调度可以走了, 因此不跳出 while 循环
+            #         new_num_rest_cars = len([car.car_id for car in self.running_cars if car.state != CAR_STOP])
+            #         if new_num_rest_cars < num_rest_cars:
+            #             num_rest_cars = new_num_rest_cars
+            #         else:
+            #             self._check_positions(self.running_cars)  # 不放心可以再检查一遍
+            #             break
+
+        for car in self.running_cars.values():
             assert car.state == CAR_STOP
 
         # 当车道的最后一辆车发生变更时, 自动更新对应道路的权重, 因此不必多虑
@@ -191,7 +240,7 @@ class Scheduler(object):
 
     def _schedule_cars_pass_cross(self, cars, right_cars, opposite_cars, left_cars):
         """偷懒起见, 很多和 _schedule_cars_move_on_the_same_way 有大量重复代码"""
-        for car in cars:
+        for car in cars.values():
             assert car
             if car.state == CAR_STOP or car.state == CAR_END:
                 continue
@@ -251,8 +300,7 @@ class Scheduler(object):
                         car.on_lane = None
                         car.on_position = None
                         car.state = CAR_END
-                        self.running_cars.remove(car)
-                        self.ended_cars.append(car)
+                        self.ended_cars[car.car_id] = self.running_cars.pop(car.car_id)
 
                         # 车辆离开车道, 车道可以变得空旷, 原先道路的状态势必改变, roadnet 的权只是可能改变
                         self._update_road_weight(road)
@@ -270,15 +318,15 @@ class Scheduler(object):
                         car.state = CAR_STOP
                         continue
                     elif car.pass_intention == 'turn_left':
-                        if right_cars and right_cars[0].pass_intention == 'go_strainght':
+                        if right_cars and list(right_cars.values())[0].pass_intention == 'go_strainght':
                             return
                         self._car_pass_cross(car, road_to_turn)
                         car.state = CAR_STOP
                         continue
                     elif car.pass_intention == 'turn_right':
-                        if left_cars and left_cars[0].pass_intention == 'go_straight':
+                        if left_cars and list(left_cars.values())[0].pass_intention == 'go_straight':
                             return
-                        if opposite_cars and opposite_cars[0].pass_intention == 'turn_left':
+                        if opposite_cars and list(opposite_cars.values())[0].pass_intention == 'turn_left':
                             return
                         self._car_pass_cross(car, road_to_turn)
                         car.state = CAR_STOP
@@ -308,6 +356,7 @@ class Scheduler(object):
                 continue
             else:
                 raise RuntimeError('迷路了吧')
+        return cars
 
     def _schedule_cars_move_on_the_same_way(self, cars):
         """
@@ -324,7 +373,7 @@ class Scheduler(object):
             # 1. 车道的某个位置要被车辆填充 (positions)
         """
 
-        for car in cars:
+        for car in cars.values():
             if car.state == CAR_STOP or car.state == CAR_END:
                 continue
 
@@ -364,8 +413,7 @@ class Scheduler(object):
                         # car.on_lane = None
                         # car.on_position = None
                         car.state = CAR_END
-                        self.running_cars.remove(car)
-                        self.ended_cars.append(car)
+                        self.ended_cars[car.car_id] = self.running_cars.pop(car.car_id)
 
                         self._update_road_weight(road)
                         continue
@@ -400,6 +448,7 @@ class Scheduler(object):
                 continue
             else:
                 raise RuntimeError('迷路了吧')
+        return cars
 
     def _car_pass_cross(self, car, road_to_turn):
         lane_to_turn = road_to_turn.allocate_lane()
@@ -608,80 +657,80 @@ class Scheduler(object):
             n=min(remain_roadnet_capacity, len(current_cars_to_run))))
 
         # 车辆持续上路, 直到达到封锁条件
-        while self.get_current_roadnet_capacity() > self.block_roadnet_capacity or self.num_cars_on_road > len(self.running_cars):
-            # 按车辆 id 升序发车
-            for car in current_cars_to_run:
-                if car.planned_departure_time > self.current_time:
-                    continue
-
-                # 车辆上路之后, 路网信息会发生改变, 因此, 在之前的规划基础上, 重新为当前车辆规划路线
-                self._make_plan_for_car_to_run(car)
-
-                # TODO: 车辆所在路口的局部容量
-                road_to_run = self._choose_a_road_to_run(car)
-
-                if not road_to_run or road_to_run.get_current_state() != DRIVEIN_ABLE:
-                    logger.info('第{t}个时间片调度\t没有为编号为{car_id}的车辆找到合适的出发道路或道路阻塞, 暂缓出发'.format(
-                        t=self.current_time, car_id=car.car_id))
-                    # cars_cannot_start_off.append(car)
-                    continue
-
-                # 车辆上路之前, 分配车道
-                lane = road_to_run.allocate_lane()
-                assert lane is not None  # 道路不阻塞, 理论上就能分配到车道
-
-                # 车辆上路, 变更量检查
-                # 1. 车要变
-                    # 1. 车速可能会变 (current_speed)
-                    # 2. 车的起始路口要变 (start_cross_id)
-                    # 3. 车绑定的道路/车道/位置信息都要变 (on_road, on_lane, on_position)
-                # 2. 车道要变
-                    # 1. 车道的某个位置要被车辆填充 (positions)
-                    # 2. 车道的容量要变 (随车辆的进出而变, 是 postitions 的一个函数)
-                    # 3. 车道的速度要变 (随车辆的进出而变, 也是 positions 的一个函数, 更确切地说, 是末位车的车速)
-                # 3. 车道所在道路要变
-                    # 1. 道路的容量要变 (是车道容量的函数)
-                    # 2. 道路状态可能会变 (车道容量的函数)
-                # 4. 路网要变
-                    # 1. 最重要的, 对应道路的权重要变
-
-                if lane.get_current_capacity() > car.current_speed:
-                    # 无法达到跟车状态, 车速保持不变
-                    lane.positions[lane.capacity-car.current_speed] = car
-                    car.on_position = lane.capacity-car.current_speed
-                else:
-                    # 会达到跟车状态, 车辆行驶到前车之后, 速度发生变更
-                    car.on_position = lane.find_last_drivein_position()  # 必须放在车辆进入车道的位置之前, 否则会后移一位
-                    car.current_speed = min(lane.get_previous_car_current_speed(car.on_position), car.current_speed)
-                    lane.positions[lane.find_last_drivein_position()] = car
-
-                # logger.info('第{t}个时间片调度\t车辆上路后, 道路{road_id}的路况变为'.format(t=self.current_time, road_id=road_to_run.road_id))
-                # for lan in road_to_run.lanes:
-                #     logger.info('\t{lane_id}的剩余容量为: {capacity}, 路况为:{pos}'.format(
-                #         lane_id=lan.lane_id, capacity=lan.get_current_capacity(), pos=lan.positions))
-
-                car.start_cross_id = road_to_run.end_cross_id
-                car.departure_time = self.current_time
-                car.passed_roads.append(road_to_run.road_id)
-                car.passed_crosses.append(road_to_run.start_cross_id)
-                car.on_road = road_to_run.road_id
-                car.on_lane = lane.lane_id
-                assert lane.positions[car.on_position] is car
-
-                # 上路的车辆加入 running_cars
-                self.cars_to_run.remove(car)
-                self.running_cars.append(car)
-                assert car in self.running_cars
-
-                # 更新道路的权重, 可能新上路的车只能开到车道的最末位, 这时候车道相当于直接报废了, 此时无法再次获得车道信息
-                relane = road_to_run.allocate_lane()
-                if relane:
-                    self.roadnet[road_to_run.start_cross_id][road_to_run.end_cross_id]['weight'] = \
-                        road_to_run.length / relane.get_last_car_current_speed()
-                else:
-                    self.roadnet[road_to_run.start_cross_id][road_to_run.end_cross_id]['weight'] = 1000
-            else:
+        # 按车辆 id 升序发车
+        for car in current_cars_to_run:
+            # if self.get_current_roadnet_capacity() < self.block_roadnet_capacity or self.num_cars_on_road < len(self.running_cars):
+            if self.get_current_roadnet_capacity() < self.block_roadnet_capacity:
                 break
+
+            if car.planned_departure_time > self.current_time:
+                continue
+
+            # 车辆上路之后, 路网信息会发生改变, 因此, 在之前的规划基础上, 重新为当前车辆规划路线
+            self._make_plan_for_car_to_run(car)
+
+            # TODO: 车辆所在路口的局部容量
+            road_to_run = self._choose_a_road_to_run(car)
+
+            if not road_to_run or road_to_run.get_current_state() != DRIVEIN_ABLE:
+                logger.info('第{t}个时间片调度\t没有为编号为{car_id}的车辆找到合适的出发道路或道路阻塞, 暂缓出发'.format(
+                    t=self.current_time, car_id=car.car_id))
+                # cars_cannot_start_off.append(car)
+                continue
+
+            # 车辆上路之前, 分配车道
+            lane = road_to_run.allocate_lane()
+            assert lane is not None  # 道路不阻塞, 理论上就能分配到车道
+
+            # 车辆上路, 变更量检查
+            # 1. 车要变
+                # 1. 车速可能会变 (current_speed)
+                # 2. 车的起始路口要变 (start_cross_id)
+                # 3. 车绑定的道路/车道/位置信息都要变 (on_road, on_lane, on_position)
+            # 2. 车道要变
+                # 1. 车道的某个位置要被车辆填充 (positions)
+                # 2. 车道的容量要变 (随车辆的进出而变, 是 postitions 的一个函数)
+                # 3. 车道的速度要变 (随车辆的进出而变, 也是 positions 的一个函数, 更确切地说, 是末位车的车速)
+            # 3. 车道所在道路要变
+                # 1. 道路的容量要变 (是车道容量的函数)
+                # 2. 道路状态可能会变 (车道容量的函数)
+            # 4. 路网要变
+                # 1. 最重要的, 对应道路的权重要变
+
+            if lane.get_current_capacity() > car.current_speed:
+                # 无法达到跟车状态, 车速保持不变
+                lane.positions[lane.capacity-car.current_speed] = car
+                car.on_position = lane.capacity-car.current_speed
+            else:
+                # 会达到跟车状态, 车辆行驶到前车之后, 速度发生变更
+                car.on_position = lane.find_last_drivein_position()  # 必须放在车辆进入车道的位置之前, 否则会后移一位
+                car.current_speed = min(lane.get_previous_car_current_speed(car.on_position), car.current_speed)
+                lane.positions[lane.find_last_drivein_position()] = car
+
+            # logger.info('第{t}个时间片调度\t车辆上路后, 道路{road_id}的路况变为'.format(t=self.current_time, road_id=road_to_run.road_id))
+            # for lan in road_to_run.lanes:
+            #     logger.info('\t{lane_id}的剩余容量为: {capacity}, 路况为:{pos}'.format(
+            #         lane_id=lan.lane_id, capacity=lan.get_current_capacity(), pos=lan.positions))
+
+            car.start_cross_id = road_to_run.end_cross_id
+            car.departure_time = self.current_time
+            car.passed_roads.append(road_to_run.road_id)
+            car.passed_crosses.append(road_to_run.start_cross_id)
+            car.on_road = road_to_run.road_id
+            car.on_lane = lane.lane_id
+            assert lane.positions[car.on_position] is car
+
+            # 上路的车辆加入 running_cars
+            self.running_cars[car.car_id] = self.cars_to_run.pop(car.car_id)
+            assert car.car_id in self.running_cars
+
+            # 更新道路的权重, 可能新上路的车只能开到车道的最末位, 这时候车道相当于直接报废了, 此时无法再次获得车道信息
+            relane = road_to_run.allocate_lane()
+            if relane:
+                self.roadnet[road_to_run.start_cross_id][road_to_run.end_cross_id]['weight'] = \
+                    road_to_run.length / relane.get_last_car_current_speed()
+            else:
+                self.roadnet[road_to_run.start_cross_id][road_to_run.end_cross_id]['weight'] = 1000
         logger.info('第{t}个时间片调度\t上路车辆调度完成'.format(t=self.current_time))
 
     def get_current_roadnet_capacity(self):
@@ -693,11 +742,11 @@ class Scheduler(object):
 
         # TODO: 更复杂的方法是对于后面的道路, 估计到达时间, 然后计算那个时候的条件
         # TODO: weight=func() 动态地计算每条路上的 weight, 是个精细活.
-        for car in self.cars_to_run:
+        for car in self.cars_to_run.values():
             self._make_plan_for_car_to_run(car)
 
-        # self.cars_to_run = sorted(self.cars_to_run, key=lambda car: int(car.car_id))
-        self.cars_to_run = sorted(self.cars_to_run, key=lambda car: car.ideal_arrival_time or int(car.car_id))
+        # self.cars_to_run = OrderedDict(sorted(self.cars_to_run.items(), key=lambda car: int(car[0])))
+        self.cars_to_run = OrderedDict(sorted(self.cars_to_run.items(), key=lambda car: car[1].ideal_arrival_time or int(car[0])))
 
     def _make_plan_for_running_car(self, car):
         for path in nx.shortest_simple_paths(self.roadnet,
@@ -736,7 +785,7 @@ class Scheduler(object):
     
     def _find_cars_to_run(self, k=None):
         """当前时间已经到了或者过了车辆的计划出发时间, 车辆可出发"""
-        current_cars_to_run = [car for car in self.cars_to_run if car.planned_departure_time <= self.current_time]
+        current_cars_to_run = [car for car in self.cars_to_run.values() if car.planned_departure_time <= self.current_time]
         if k:
             return sorted(current_cars_to_run, key=lambda c: int(c.car_id))[:k]
         else:
